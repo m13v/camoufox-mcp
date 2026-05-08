@@ -31,8 +31,21 @@ DEFAULT_PROFILE_ROOT = Path(
 DEFAULT_SHOTS_DIR = Path(
     os.environ.get("CAMOUFOX_MCP_SCREENSHOTS_DIR", str(Path.home() / ".camoufox-mcp" / "screenshots"))
 )
+DEFAULT_STORAGE_DIR = Path(
+    os.environ.get("CAMOUFOX_MCP_STORAGE_DIR", str(Path.home() / ".camoufox-mcp" / "storage"))
+)
+# Auto-save storage_state JSON on close + auto-restore on open. Default ON.
+AUTO_PERSIST = os.environ.get("CAMOUFOX_MCP_AUTO_PERSIST", "1") not in ("0", "false", "False")
+# Auto-save interval (seconds). 0 = only save on close. Default: every 30s while session is open.
+AUTO_PERSIST_INTERVAL = int(os.environ.get("CAMOUFOX_MCP_AUTO_PERSIST_INTERVAL", "30"))
+
 DEFAULT_PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
 DEFAULT_SHOTS_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _storage_path(name: str) -> Path:
+    return DEFAULT_STORAGE_DIR / f"{_safe_name(name)}.storage.json"
 
 
 @dataclass
@@ -44,6 +57,8 @@ class Session:
     page: Any  # active page
     headless: bool
     created_at: float = field(default_factory=time.time)
+    autosave_task: Optional[asyncio.Task] = None
+    last_autosave_at: float = 0.0
 
 
 SESSIONS: dict[str, Session] = {}
@@ -66,6 +81,80 @@ def _safe_name(name: str) -> str:
     """Sanitize profile name to a directory-safe slug."""
     keep = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
     return "".join(c if c in keep else "_" for c in name)[:80] or "default"
+
+
+def _profile_is_empty(profile_dir: Path) -> bool:
+    """A profile is 'empty' if it has no Firefox prefs.js (i.e. never been used)."""
+    return not (profile_dir / "prefs.js").exists()
+
+
+async def _dump_storage(sess: Session) -> dict:
+    """Dump storage_state to disk for `sess`, return summary."""
+    state = await sess.page.context.storage_state()
+    target = _storage_path(sess.name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(state, indent=2, default=str))
+    sess.last_autosave_at = time.time()
+    return {
+        "path": str(target),
+        "cookies": len(state.get("cookies", [])),
+        "origins": len(state.get("origins", [])),
+        "localStorage_entries": sum(len(o.get("localStorage", [])) for o in state.get("origins", [])),
+    }
+
+
+async def _restore_storage(sess: Session) -> Optional[dict]:
+    """If a storage JSON exists for this session name, restore cookies + localStorage."""
+    src = _storage_path(sess.name)
+    if not src.exists():
+        return None
+    try:
+        state = json.loads(src.read_text())
+    except Exception as e:
+        return {"error": f"unreadable storage file: {e}"}
+
+    cookies = state.get("cookies", [])
+    if cookies:
+        await sess.page.context.add_cookies(cookies)
+
+    # Inject localStorage per origin
+    n_ls = 0
+    for origin in state.get("origins", []):
+        url = origin.get("origin")
+        items = origin.get("localStorage", [])
+        if not url or not items:
+            continue
+        try:
+            await sess.page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await sess.page.evaluate(
+                "(items) => { for (const it of items) { try { localStorage.setItem(it.name, it.value); } catch(e){} } }",
+                items,
+            )
+            n_ls += len(items)
+        except Exception:
+            continue
+
+    return {
+        "restored_cookies": len(cookies),
+        "restored_localStorage_entries": n_ls,
+    }
+
+
+async def _autosave_loop(name: str, interval: int) -> None:
+    """Background task: periodically dump storage_state to disk while session is open."""
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            sess = SESSIONS.get(name)
+            if sess is None:
+                return
+            try:
+                await _dump_storage(sess)
+            except Exception:
+                # silently swallow; will retry on next tick
+                pass
+        except asyncio.CancelledError:
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +206,8 @@ async def camoufox_open(
         return json.dumps(info, indent=2)
 
     profile_dir = DEFAULT_PROFILE_ROOT / _safe_name(name)
+    # Capture emptiness BEFORE Firefox creates prefs.js etc.
+    was_empty = _profile_is_empty(profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     kwargs: dict[str, Any] = {
@@ -140,8 +231,20 @@ async def camoufox_open(
     sess = Session(name=name, profile_dir=profile_dir, cm=cm, browser=browser, page=page, headless=headless)
     SESSIONS[name] = sess
 
+    # Auto-restore credentials from storage JSON if profile is brand new
+    restored = None
+    if AUTO_PERSIST and was_empty:
+        try:
+            restored = await _restore_storage(sess)
+        except Exception as e:
+            restored = {"error": str(e)}
+
     if url:
         await page.goto(url, wait_until="domcontentloaded")
+
+    # Spin up background autosave task
+    if AUTO_PERSIST and AUTO_PERSIST_INTERVAL > 0:
+        sess.autosave_task = asyncio.create_task(_autosave_loop(name, AUTO_PERSIST_INTERVAL))
 
     return json.dumps({
         "status": "opened",
@@ -149,6 +252,8 @@ async def camoufox_open(
         "profile_dir": str(profile_dir),
         "headless": headless,
         "url": page.url,
+        "auto_persist": AUTO_PERSIST,
+        "restored_from_json": restored,
     }, indent=2)
 
 
@@ -162,21 +267,36 @@ async def camoufox_close(name: str = "default") -> str:
     if name == "*":
         closed = []
         for n in list(SESSIONS.keys()):
-            await _close_one(n)
-            closed.append(n)
+            saved = await _close_one(n)
+            closed.append({"name": n, "saved": saved})
         return json.dumps({"status": "closed_all", "sessions": closed}, indent=2)
-    await _close_one(name)
-    return json.dumps({"status": "closed", "name": name}, indent=2)
+    saved = await _close_one(name)
+    return json.dumps({"status": "closed", "name": name, "saved": saved}, indent=2)
 
 
-async def _close_one(name: str) -> None:
+async def _close_one(name: str) -> Optional[dict]:
     sess = SESSIONS.pop(name, None)
     if sess is None:
-        return
+        return None
+    # Stop autosave loop
+    if sess.autosave_task is not None:
+        sess.autosave_task.cancel()
+        try:
+            await sess.autosave_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    # Final save BEFORE closing the context (browser must still be alive)
+    saved = None
+    if AUTO_PERSIST:
+        try:
+            saved = await _dump_storage(sess)
+        except Exception as e:
+            saved = {"error": str(e)}
     try:
         await sess.cm.__aexit__(None, None, None)
     except Exception:
         pass
+    return saved
 
 
 @mcp.tool()
@@ -374,27 +494,98 @@ async def camoufox_get_cookies(name: str, domain: Optional[str] = None) -> str:
 
 
 @mcp.tool()
-async def camoufox_save_storage(name: str, path: str) -> str:
-    """Save the full storage_state (cookies + localStorage) to a JSON file.
+async def camoufox_save_storage(name: str, path: Optional[str] = None) -> str:
+    """Save full storage_state (cookies + localStorage) to JSON.
+
+    Auto-persistence is on by default, so you usually don't need to call this.
+    Use it to take an immediate snapshot or save to a custom location.
 
     Args:
         name: Session name.
-        path: Output JSON file path.
+        path: Output JSON file path. If omitted, saves to the default location
+              ~/.camoufox-mcp/storage/<name>.storage.json (the auto-restore source).
     """
     sess = _require(name)
     state = await sess.page.context.storage_state()
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(state, indent=2, default=str))
+    target = Path(path) if path else _storage_path(name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(state, indent=2, default=str))
     n_cookies = len(state.get("cookies", []))
     n_origins = len(state.get("origins", []))
     n_localstorage = sum(len(o.get("localStorage", [])) for o in state.get("origins", []))
     return json.dumps({
         "status": "saved",
-        "path": path,
+        "path": str(target),
         "cookies": n_cookies,
         "origins": n_origins,
         "localStorage_entries": n_localstorage,
     }, indent=2)
+
+
+@mcp.tool()
+async def camoufox_load_storage(name: str, path: Optional[str] = None) -> str:
+    """Load a saved storage_state (cookies + localStorage) into an OPEN session.
+
+    Useful for hand-importing cookies from another machine or restoring an
+    older snapshot. The session must already be open.
+
+    Args:
+        name: Session name (must be open).
+        path: Source JSON path. If omitted, loads from the default location
+              ~/.camoufox-mcp/storage/<name>.storage.json
+    """
+    sess = _require(name)
+    src = Path(path) if path else _storage_path(name)
+    if not src.exists():
+        raise ValueError(f"Storage file not found: {src}")
+    result = await _restore_storage(sess)
+    return json.dumps({"status": "loaded", "path": str(src), **(result or {})}, indent=2)
+
+
+@mcp.tool()
+async def camoufox_list_saved() -> str:
+    """List all saved session profiles on disk (storage JSONs and profile dirs)."""
+    storage_files = sorted(DEFAULT_STORAGE_DIR.glob("*.storage.json"))
+    profile_dirs = sorted([p for p in DEFAULT_PROFILE_ROOT.iterdir() if p.is_dir()]) if DEFAULT_PROFILE_ROOT.exists() else []
+    out = {
+        "storage_dir": str(DEFAULT_STORAGE_DIR),
+        "profile_root": str(DEFAULT_PROFILE_ROOT),
+        "saved": [],
+    }
+    seen = set()
+    for sf in storage_files:
+        name = sf.name.replace(".storage.json", "")
+        seen.add(name)
+        try:
+            state = json.loads(sf.read_text())
+            cookies = len(state.get("cookies", []))
+            ls_entries = sum(len(o.get("localStorage", [])) for o in state.get("origins", []))
+            origins = [o.get("origin") for o in state.get("origins", [])][:5]
+        except Exception:
+            cookies = ls_entries = 0
+            origins = []
+        profile_dir = DEFAULT_PROFILE_ROOT / name
+        out["saved"].append({
+            "name": name,
+            "storage_json": str(sf),
+            "profile_dir": str(profile_dir) if profile_dir.exists() else None,
+            "cookies": cookies,
+            "localStorage_entries": ls_entries,
+            "origins_sample": origins,
+            "storage_modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(sf.stat().st_mtime)),
+        })
+    # Profiles without a storage JSON yet
+    for pd in profile_dirs:
+        if pd.name in seen:
+            continue
+        out["saved"].append({
+            "name": pd.name,
+            "storage_json": None,
+            "profile_dir": str(pd),
+            "cookies": None,
+            "localStorage_entries": None,
+        })
+    return json.dumps(out, indent=2)
 
 
 @mcp.tool()
