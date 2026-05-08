@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+*.so
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Camoufox runtime data
+profiles/
+*.cookies.json
+*.storage.json
+screenshots/
+
+# Logs
+*.log
+logs/
+
+# Local secrets / scratch
+.env
+.env.local
+scratch/
+scripts/
