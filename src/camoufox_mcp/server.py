@@ -35,9 +35,11 @@ DEFAULT_STORAGE_DIR = Path(
     os.environ.get("CAMOUFOX_MCP_STORAGE_DIR", str(Path.home() / ".camoufox-mcp" / "storage"))
 )
 # Auto-save storage_state JSON on close + auto-restore on open. Default ON.
+# (No periodic autosave: in Firefox, storage_state() navigates to each saved
+# origin to read localStorage, which flashes the window every tick AND tripped
+# LinkedIn anti-bot detection on 2026-05-08, invalidating live sessions. The
+# persistent profile dir already keeps cookies natively across launches.)
 AUTO_PERSIST = os.environ.get("CAMOUFOX_MCP_AUTO_PERSIST", "1") not in ("0", "false", "False")
-# Auto-save interval (seconds). 0 = only save on close. Default: every 30s while session is open.
-AUTO_PERSIST_INTERVAL = int(os.environ.get("CAMOUFOX_MCP_AUTO_PERSIST_INTERVAL", "30"))
 
 DEFAULT_PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
 DEFAULT_SHOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -57,8 +59,6 @@ class Session:
     page: Any  # active page
     headless: bool
     created_at: float = field(default_factory=time.time)
-    autosave_task: Optional[asyncio.Task] = None
-    last_autosave_at: float = 0.0
 
 
 SESSIONS: dict[str, Session] = {}
@@ -94,7 +94,6 @@ async def _dump_storage(sess: Session) -> dict:
     target = _storage_path(sess.name)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(state, indent=2, default=str))
-    sess.last_autosave_at = time.time()
     return {
         "path": str(target),
         "cookies": len(state.get("cookies", [])),
@@ -138,23 +137,6 @@ async def _restore_storage(sess: Session) -> Optional[dict]:
         "restored_cookies": len(cookies),
         "restored_localStorage_entries": n_ls,
     }
-
-
-async def _autosave_loop(name: str, interval: int) -> None:
-    """Background task: periodically dump storage_state to disk while session is open."""
-    while True:
-        try:
-            await asyncio.sleep(interval)
-            sess = SESSIONS.get(name)
-            if sess is None:
-                return
-            try:
-                await _dump_storage(sess)
-            except Exception:
-                # silently swallow; will retry on next tick
-                pass
-        except asyncio.CancelledError:
-            return
 
 
 # ---------------------------------------------------------------------------
@@ -242,10 +224,6 @@ async def camoufox_open(
     if url:
         await page.goto(url, wait_until="domcontentloaded")
 
-    # Spin up background autosave task
-    if AUTO_PERSIST and AUTO_PERSIST_INTERVAL > 0:
-        sess.autosave_task = asyncio.create_task(_autosave_loop(name, AUTO_PERSIST_INTERVAL))
-
     return json.dumps({
         "status": "opened",
         "name": name,
@@ -278,13 +256,6 @@ async def _close_one(name: str) -> Optional[dict]:
     sess = SESSIONS.pop(name, None)
     if sess is None:
         return None
-    # Stop autosave loop
-    if sess.autosave_task is not None:
-        sess.autosave_task.cancel()
-        try:
-            await sess.autosave_task
-        except (asyncio.CancelledError, Exception):
-            pass
     # Final save BEFORE closing the context (browser must still be alive)
     saved = None
     if AUTO_PERSIST:
