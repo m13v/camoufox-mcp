@@ -36,3 +36,5 @@ logs/
 .env.local
 scratch/
 scripts/
+# Local end-to-end PostHog test pulls real creds from gmail-dwd + keychain
+examples/posthog_*.py
