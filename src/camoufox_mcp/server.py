@@ -213,9 +213,15 @@ async def camoufox_open(
     sess = Session(name=name, profile_dir=profile_dir, cm=cm, browser=browser, page=page, headless=headless)
     SESSIONS[name] = sess
 
-    # Auto-restore credentials from storage JSON if profile is brand new
+    # Auto-restore credentials from storage JSON.
+    # Always restore (not just on empty profiles) so that fresh cookies dumped
+    # from a Chrome session (e.g. via dump_twitter_storage.py) are injected on
+    # every open. Without this, the existing Firefox profile's native cookie
+    # store (which may lack auth_token or have stale tokens) is used instead,
+    # causing auth-dependent API calls (e.g. Twitter search) to fail silently
+    # while non-auth calls (home timeline, DMs) still work via guest session.
     restored = None
-    if AUTO_PERSIST and was_empty:
+    if AUTO_PERSIST and _storage_path(name).exists():
         try:
             restored = await _restore_storage(sess)
         except Exception as e:
